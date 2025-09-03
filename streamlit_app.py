@@ -1,97 +1,108 @@
 import streamlit as st
 import pandas as pd
 import pydeck as pdk
-import random
+import math
 
 st.set_page_config(page_title="Warehouse Mapper", page_icon="🗺️", layout="wide")
-
 st.title("🗺️ Warehouse Mapper")
-st.caption("Basemaps: CARTO + OpenStreetMap. Upload a CSV: Column A = latitude, Column B = longitude.")
+st.caption("Upload a CSV with latitude in column A and longitude in column B (headers optional). Each point is drawn as a colored circle.")
 
-with st.sidebar:
-    st.header("Upload")
-    uploaded = st.file_uploader("Upload CSV (lat in col A, lon in col B)", type=["csv"])
-    use_sample = st.checkbox("Use sample data instead", value=not uploaded)
+# --- Helpers -----------------------------------------------------------------
+def read_latlon_csv(uploaded_file: st.runtime.uploaded_file_manager.UploadedFile) -> pd.DataFrame:
+    """
+    Read a CSV that has lat in column A and lon in column B.
+    Works with or without headers. Coerces to numeric and drops invalid rows.
+    """
+    # Try headerless first (most strict for the A/B requirement)
+    try:
+        df = pd.read_csv(uploaded_file, header=None)
+    except Exception:
+        # Fallback: Streamlit might need reset file pointer
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file, header=None)
 
-def _prepare_dataframe(df: pd.DataFrame) -> pd.DataFrame:
-    df = df.copy()
     if df.shape[1] < 2:
-        raise ValueError("CSV must have at least two columns (latitude in column A and longitude in column B).")
-    cols = list(df.columns)
-    df = df.rename(columns={cols[0]: "latitude", cols[1]: "longitude"})
+        # Try again assuming headers exist
+        uploaded_file.seek(0)
+        df = pd.read_csv(uploaded_file)
+
+        if df.shape[1] < 2:
+            raise ValueError("CSV must have at least two columns for latitude and longitude.")
+
+        cols = list(df.columns)
+        lat_col, lon_col = cols[0], cols[1]
+        df = df.rename(columns={lat_col: "latitude", lon_col: "longitude"})
+    else:
+        df = df.rename(columns={0: "latitude", 1: "longitude"})
+
     df["latitude"] = pd.to_numeric(df["latitude"], errors="coerce")
     df["longitude"] = pd.to_numeric(df["longitude"], errors="coerce")
     df = df.dropna(subset=["latitude", "longitude"]).reset_index(drop=True)
-    if "color" not in df.columns:
-        df["color"] = None
-    return df[["latitude", "longitude", "color"]]
-
-if use_sample and not uploaded:
-    df = pd.read_csv("sample_data/warehouses.csv")
-    df = _prepare_dataframe(df)
-else:
-    if uploaded:
-        df_raw = pd.read_csv(uploaded, header=None)
-        if df_raw.shape[1] < 2:
-            uploaded.seek(0)
-            df_raw = pd.read_csv(uploaded)
-        df = _prepare_dataframe(df_raw)
-    else:
-        df = pd.DataFrame(columns=["latitude", "longitude", "color"])
-
-st.subheader("Step 1 — Assign Colors")
-st.write("Edit the color hex codes (#RRGGBB) for each warehouse point.")
-
-def _random_color_hex():
-    return "#{:06x}".format(random.randint(0, 0xFFFFFF))
-
-if df.shape[0] > 0:
-    df["color"] = [_random_color_hex() for _ in range(len(df))]
+    return df[["latitude", "longitude"]]
 
 
-edited = st.data_editor(
-    df,
-    num_rows="dynamic",
-    use_container_width=True,
-    key="editor",
-)
+def distinct_palette_rgba(n: int, alpha: int = 200):
+    """
+    Generate n distinct RGBA colors using an HSL sweep.
+    Returns a list of [r,g,b,a] lists.
+    """
+    def hsl_to_rgb(h, s, l):
+        # h in [0,1), s,l in [0,1]
+        def hue2rgb(p, q, t):
+            if t < 0: t += 1
+            if t > 1: t -= 1
+            if t < 1/6: return p + (q - p) * 6 * t
+            if t < 1/2: return q
+            if t < 2/3: return p + (q - p) * (2/3 - t) * 6
+            return p
+        if s == 0:
+            r = g = b = l
+        else:
+            q = l * (1 + s) if l < 0.5 else l + s - l * s
+            p = 2 * l - q
+            r = hue2rgb(p, q, h + 1/3)
+            g = hue2rgb(p, q, h)
+            b = hue2rgb(p, q, h - 1/3)
+        return [int(r*255), int(g*255), int(b*255)]
 
-st.download_button(
-    "⬇️ Download edited CSV",
-    data=edited.to_csv(index=False).encode("utf-8"),
-    file_name="warehouses_edited.csv",
-    mime="text/csv",
-)
+    palette = []
+    for i in range(max(n, 1)):
+        h = (i / max(n, 1)) % 1.0       # evenly spaced hue
+        s = 0.65                         # fairly saturated
+        l = 0.50                         # medium lightness
+        r, g, b = hsl_to_rgb(h, s, l)
+        palette.append([r, g, b, alpha])
+    return palette
 
-st.markdown("---")
-st.subheader("Step 2 — Basemap & Styling")
 
-basemap = st.selectbox(
-    "Choose basemap",
-    ["CARTO Light", "CARTO Dark", "OpenStreetMap Standard"],
-    index=0,
-)
+# --- UI ----------------------------------------------------------------------
+with st.sidebar:
+    st.header("Upload")
+    uploaded = st.file_uploader("Upload CSV (lat in column A, lon in column B)", type=["csv"])
+    point_radius = st.slider("Point radius (meters)", min_value=200, max_value=80000, value=3000, step=100)
+    basemap = st.selectbox(
+        "Basemap",
+        ["CARTO Light", "CARTO Dark", "OpenStreetMap"],
+        index=0
+    )
 
-point_radius = st.slider("Point radius (meters)", min_value=100, max_value=80000, value=2000, step=100)
+# Load data
+if not uploaded:
+    st.info("Upload a CSV to display your warehouse locations.")
+    st.stop()
 
-def hex_to_rgb(h):
-    if not isinstance(h, str) or not h.startswith("#") or len(h) not in (4, 7):
-        return [0, 122, 204, 200]
-    h = h.lstrip("#")
-    if len(h) == 3:
-        h = "".join([c*2 for c in h])
-    try:
-        r = int(h[0:2], 16)
-        g = int(h[2:4], 16)
-        b = int(h[4:6], 16)
-        return [r, g, b, 200]
-    except Exception:
-        return [0, 122, 204, 200]
+try:
+    df = read_latlon_csv(uploaded)
+except Exception as e:
+    st.error(f"Could not read CSV: {e}")
+    st.stop()
 
-if edited.shape[0] > 0:
-    edited = edited.copy()
-    edited["fill_rgba"] = edited["color"].apply(hex_to_rgb)
+# Assign a distinct color to every row
+palette = distinct_palette_rgba(len(df), alpha=220)
+df = df.copy()
+df["fill_rgba"] = palette
 
+# Choose basemap tiles
 if basemap == "CARTO Light":
     tile_url = "https://basemaps.cartocdn.com/light_all/{z}/{x}/{y}.png"
 elif basemap == "CARTO Dark":
@@ -109,7 +120,7 @@ tile_layer = pdk.Layer(
 
 scatter = pdk.Layer(
     "ScatterplotLayer",
-    data=edited if edited.shape[0] > 0 else pd.DataFrame(columns=["latitude", "longitude", "fill_rgba"]),
+    data=df,
     get_position="[longitude, latitude]",
     get_fill_color="fill_rgba",
     get_radius=point_radius,
@@ -117,22 +128,23 @@ scatter = pdk.Layer(
     auto_highlight=True,
 )
 
-if edited.shape[0] > 0:
-    center_lat = float(edited["latitude"].mean())
-    center_lon = float(edited["longitude"].mean())
-    zoom = 4 if edited.shape[0] > 1 else 8
+# View
+if len(df) > 0:
+    center_lat = float(df["latitude"].mean())
+    center_lon = float(df["longitude"].mean())
+    zoom = 4 if len(df) > 1 else 8
 else:
     center_lat, center_lon, zoom = 39.5, -98.35, 3
 
 view_state = pdk.ViewState(latitude=center_lat, longitude=center_lon, zoom=zoom, bearing=0, pitch=0)
 
-r = pdk.Deck(
+deck = pdk.Deck(
     layers=[tile_layer, scatter],
     initial_view_state=view_state,
     map_style=None,
-    tooltip={"text": "Lat: {latitude}\nLon: {longitude}"},
+    tooltip={"text": "Lat: {latitude}\nLon: {longitude}"}
 )
 
-st.pydeck_chart(r, use_container_width=True)
-
+st.pydeck_chart(deck, use_container_width=True)
 st.markdown("**Attribution**: © OpenStreetMap contributors; © CARTO basemaps.")
+
