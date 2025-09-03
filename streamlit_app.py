@@ -46,8 +46,8 @@ def _random_color_hex():
     return "#{:06x}".format(random.randint(0, 0xFFFFFF))
 
 if df.shape[0] > 0:
-    if df["color"].isna().all() or (df["color"] == "").all():
-        df["color"] = [_random_color_hex() for _ in range(len(df))]
+    df["color"] = [_random_color_hex() for _ in range(len(df))]
+
 
 edited = st.data_editor(
     df,
